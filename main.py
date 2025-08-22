@@ -1,26 +1,36 @@
-from fastapi import FastAPI, Form
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional
+import cv2
+import numpy as np
 import os
 import hmac
 import hashlib
-from datetime import datetime, timezone
 import requests
+import json
+import base64
+from datetime import datetime, timezone
+from typing import Optional, List, Dict, Any
+from dotenv import load_dotenv
+load_dotenv()
 
-import numpy as np
+from fastapi import FastAPI, Form
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from PIL import Image
 from io import BytesIO
 
-#Supabase Admin (service role) to update rows server-side
+# Supabase Admin (service role) to update rows server-side
 from supabase import create_client, Client
+
+# The core API client for Gemini
+API_URL_BASE = "https://generativelanguage.googleapis.com/v1beta/models/"
+GEMINI_MODEL = "gemini-2.5-flash-preview-05-20"
+IMAGE_GEN_MODEL = "imagen-3.0-generate-002"
 
 app = FastAPI()
 
 # CORS (tighten in production)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # or ["http://localhost:19006", "http://127.0.0.1:19006"]
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -30,7 +40,8 @@ app.add_middleware(
 #--------- Environment / Config ----------
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-QR_HMAC_SECRET = os.environ.get("QR_HMAC_SECRET", "dev-secret") # replace in prod
+QR_HMAC_SECRET = os.environ.get("QR_HMAC_SECRET", "dev-secret")
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY") 
 
 supabase: Optional[Client] = None
 if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
@@ -42,8 +53,10 @@ GEOFENCE_RADIUS_M = 150 # meters
 WINDOW_START = datetime(2025, 8, 22, 8, 0, 0, tzinfo=timezone.utc)
 WINDOW_END = datetime(2025, 8, 22, 18, 0, 0, tzinfo=timezone.utc)
 
-#--------- Helpers ----------
+
+#--------- Helper Functions ----------
 def haversine_m(a_lat: float, a_lon: float, b_lat: float, b_lon: float) -> float:
+    """Calculates the distance between two points on Earth using Haversine formula."""
     import math
     R = 6371000.0
     dLat = math.radians(b_lat - a_lat)
@@ -54,28 +67,20 @@ def haversine_m(a_lat: float, a_lon: float, b_lat: float, b_lon: float) -> float
     return 2 * R * math.asin(math.sqrt(h))
 
 def check_geofence(lat: float, lon: float):
+    """Checks if the provided coordinates are within the defined geofence."""
     dist = haversine_m(lat, lon, GEOFENCE_CENTER[0], GEOFENCE_CENTER[1])
     if dist <= GEOFENCE_RADIUS_M:
         return True, None
     return False, "Out of allowed zone"
 
 def check_time_window(now: datetime):
+    """Checks if the current time is within the allowed time window."""
     if WINDOW_START <= now <= WINDOW_END:
         return True, None
     return False, "Outside allowed time"
 
 def verify_qr_hmac(qr_value: str):
-    """
-    Simple signed QR format:
-    qr_value = "<payload>.<sighex>"
-    where sighex = HMAC-SHA256(secret, payload).hexdigest()
-
-    Client-side, you create:
-      payload = "ID12345" (or a JSON/base64 string)
-      sighex = hmac.new(QR_HMAC_SECRET, payload, sha256).hexdigest()
-
-    Server checks signature matches.
-    """
+    """Verifies the HMAC signature of a QR code payload."""
     if not qr_value:
         return False, "Missing QR"
     try:
@@ -86,56 +91,98 @@ def verify_qr_hmac(qr_value: str):
         mac = hmac.new(QR_HMAC_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(mac, sighex):
             return False, "QR signature invalid"
-        # Optional: parse payload for exp/nonce and check DB for one-time usage
         return True, None
     except Exception:
         return False, "QR verification error"
 
-#---- NSFW stub (replace with real model later) ----
-
-def nsfw_prob_stub(image_url: str) -> float:
-    """
-    Stub NSFW classifier — always returns 0.0 (safe).
-    Replace with a real ML model later.
-    """
-    return 0.0
-
 def load_image_from_url(url: str):
+    """Fetches an image from a URL and returns it as base64 data."""
     r = requests.get(url, timeout=10)
     r.raise_for_status()
+    # Convert image to bytes and then to base64
     img = Image.open(BytesIO(r.content)).convert("RGB")
-    return np.array(img)
+    buf = BytesIO()
+    img.save(buf, format="JPEG")
+    return base64.b64encode(buf.getvalue()).decode('utf-8')
 
-def check_billboard_size(image: np.ndarray):
-    h, w, _ = image.shape
-    aspect = w / h
-    if h > 2000 or w > 2000:  # arbitrary threshold
-        return False, "Billboard too large"
-    if aspect < 0.5 or aspect > 2.0:
-        return False, "Billboard aspect ratio invalid"
-    return True, None
+def analyze_image_with_gemini(image_url: str) -> Dict[str, Any]:
+    """
+    Analyzes an image using the Gemini API.
+    It checks for a billboard, reads text, and checks for sensitive content.
+    """
+    if not GOOGLE_API_KEY:
+        return {"status": "error", "message": "API key not found."}
 
-import easyocr
-reader = easyocr.Reader(["en"])
-
-def check_text_compliance(image: np.ndarray):
+    # Fetch and encode the image
     try:
-        results = reader.readtext(image)
-        detected_texts = [res[1] for res in results]
-        print("Detected:", detected_texts)
-        if not any("LIC" in t.upper() for t in detected_texts):
-            return False, "Missing license text"
-        return True, None
+        image_data = load_image_from_url(image_url)
     except Exception as e:
-        return False, f"OCR failed: {str(e)}"
+        return {"status": "error", "message": f"Could not load image from URL: {e}"}
 
+    # Create a structured prompt for Gemini
+    prompt_text = (
+        "Analyze this image. "
+        "1. Is there a clear outdoor billboard or hoarding present? (Answer 'yes' or 'no'). "
+        "2. Transcribe any text visible on the billboard. "
+        "3. Is the content sensitive, violent, or sexually explicit? (Answer 'yes' or 'no'). "
+        "Provide your response as a JSON object with the keys 'is_billboard', 'detected_text', and 'is_sensitive'."
+    )
+    
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt_text},
+                    {
+                        "inlineData": {
+                            "mimeType": "image/jpeg",
+                            "data": image_data
+                        }
+                    }
+                ]
+            }
+        ],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseSchema": {
+                "type": "OBJECT",
+                "properties": {
+                    "is_billboard": {"type": "STRING"},
+                    "detected_text": {"type": "STRING"},
+                    "is_sensitive": {"type": "STRING"}
+                }
+            }
+        }
+    }
+
+    url = f"{API_URL_BASE}{GEMINI_MODEL}:generateContent?key={GOOGLE_API_KEY}"
+    
+    try:
+        response = requests.post(url, json=payload, timeout=20)
+        response.raise_for_status()
+        data = response.json()
+        
+        # The response is a JSON string, so we need to parse it
+        json_string = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "{}")
+        result = json.loads(json_string)
+        
+        return {"status": "success", "data": result}
+    except requests.exceptions.RequestException as e:
+        print(f"API request failed: {e}")
+        return {"status": "error", "message": f"Gemini API request failed: {e}"}
+    except json.JSONDecodeError as e:
+        print(f"JSON decoding failed: {e}. Raw response: {response.text}")
+        return {"status": "error", "message": "Failed to parse API response."}
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+        return {"status": "error", "message": "An unexpected error occurred."}
 
 
 #--------- Schemas ----------
 class AnalyzeResponse(BaseModel):
     status: str # "success" | "violation" | "error"
     message: str
-
+    
 #--------- Route ----------
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(
@@ -145,65 +192,67 @@ async def analyze(
     qr_value: str = Form(""),
     report_id: Optional[str] = Form(None), # Supabase reports.id for server-side update
 ):
-    # 1) Quick URL reachability check
+    """Analyzes a reported billboard image for potential violations using AI."""
+    violations: List[str] = []
+
+    # 1) Check URL reachability
     try:
         r = requests.head(image_url, timeout=5)
         if r.status_code >= 400:
-            return {"status": "error", "message": "Image URL not accessible"}
+            violations.append("Image URL not accessible")
     except Exception:
-        return {"status": "error", "message": "Image URL check failed"}
+        violations.append("Image URL check failed")
+
+    if violations:
+        return {"status": "error", "message": "; ".join(violations)}
 
     # 2) Geofence & time window
     ok_geo, geo_msg = check_geofence(lat, lon)
+    if not ok_geo:
+        violations.append(geo_msg)
+    
     ok_time, time_msg = check_time_window(datetime.now(timezone.utc))
+    if not ok_time:
+        violations.append(time_msg)
 
-    violations = []
+    # 3) AI-powered analysis with Gemini API
+    ai_result = analyze_image_with_gemini(image_url)
 
-    try:
-        img = load_image_from_url(image_url)
-
-        ok_size, size_msg = check_billboard_size(img)
-        ok_text, text_msg = check_text_compliance(img)
-
-        if not ok_size:
-            violations.append(size_msg)
-        if not ok_text:
-            violations.append(text_msg)
-
-    except Exception as e:
-        violations.append(f"ML check failed: {str(e)}")
-
-    # 3) QR HMAC verification (optional)
-    if qr_value:
-        ok_qr, qr_msg = verify_qr_hmac(qr_value)
+    if ai_result["status"] == "error":
+        violations.append(f"AI analysis failed: {ai_result['message']}")
     else:
-        ok_qr, qr_msg = True, None   # ✅ treat missing QR as allowed
+        ai_data = ai_result["data"]
+        # Convert to lowercase for reliable comparison
+        is_billboard = ai_data.get("is_billboard", "no").lower() == "yes"
+        is_sensitive = ai_data.get("is_sensitive", "no").lower() == "yes"
+        detected_text = ai_data.get("detected_text", "")
 
-    # 4) Content policy (NSFW) - stub for now
-    nsfw_threshold = 0.80
-    try:
-        nsfw_score = nsfw_prob_stub(image_url)  # replace with real model later
-    except Exception:
-        nsfw_score = 0.0  # fail-open
+        # Check for billboard presence
+        if not is_billboard:
+            violations.append("No billboard detected.")
+        
+        # Check for sensitive content
+        if is_sensitive:
+            violations.append("Sensitive content detected.")
+        
+        # Check for license/compliance text (example)
+        # We only add this violation if a billboard was detected
+        if is_billboard and detected_text and "LIC" not in detected_text.upper():
+            violations.append("No license information detected.")
 
-    # 5) Collect violations
-    if not ok_geo: violations.append(geo_msg)
-    if not ok_time: violations.append(time_msg)
-    if not ok_qr: violations.append(qr_msg)
-    if nsfw_score >= nsfw_threshold: violations.append("NSFW content")
+    # 4) QR HMAC verification
+    ok_qr, qr_msg = verify_qr_hmac(qr_value)
+    if not ok_qr:
+        violations.append(qr_msg)
 
-    if violations:
-        status = "violation"
-        message = "; ".join([m for m in violations if m])
-    else:
-        status = "success"
-        message = "All checks passed"
+    # 5) Determine final status and update Supabase
+    status = "violation" if violations else "success"
+    message = "; ".join(violations) if violations else "All checks passed"
 
-    # 6) Server-side update of Supabase row (if report_id provided and service key set)
     if supabase and report_id:
         try:
             supabase.table("reports").update({"status": status, "message": message}).eq("id", report_id).execute()
-        except Exception:
-            # Don't fail the API response if the update fails; log in real deployment
-            pass
+        except Exception as e:
+            print(f"Failed to update Supabase row: {e}")
+
     return {"status": status, "message": message}
