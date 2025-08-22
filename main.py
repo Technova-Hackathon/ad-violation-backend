@@ -7,7 +7,7 @@ import hmac
 import hashlib
 from datetime import datetime, timezone
 import requests
-import cv2
+
 import numpy as np
 from PIL import Image
 from io import BytesIO
@@ -28,8 +28,8 @@ app.add_middleware(
 
 
 #--------- Environment / Config ----------
-SUPABASE_URL = os.environ.get("https://uwftfrikbdgzzppgequh.supabase.co")
-SUPABASE_SERVICE_ROLE_KEY = os.environ.get("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InV3ZnRmcmlrYmRnenpwcGdlcXVoIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1NTcxNzk5OCwiZXhwIjoyMDcxMjkzOTk4fQ.pDYPaUmRcrWZFmg5jSAdKPoasgdF42o8zxjQGQIzAHk")
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 QR_HMAC_SECRET = os.environ.get("QR_HMAC_SECRET", "dev-secret") # replace in prod
 
 supabase: Optional[Client] = None
@@ -92,6 +92,14 @@ def verify_qr_hmac(qr_value: str):
         return False, "QR verification error"
 
 #---- NSFW stub (replace with real model later) ----
+
+def nsfw_prob_stub(image_url: str) -> float:
+    """
+    Stub NSFW classifier — always returns 0.0 (safe).
+    Replace with a real ML model later.
+    """
+    return 0.0
+
 def load_image_from_url(url: str):
     r = requests.get(url, timeout=10)
     r.raise_for_status()
@@ -111,13 +119,16 @@ import easyocr
 reader = easyocr.Reader(["en"])
 
 def check_text_compliance(image: np.ndarray):
-    results = reader.readtext(image)
-    detected_texts = [res[1] for res in results]
-    print("Detected:", detected_texts)
-    # Example rule: must contain a license ID like "LIC-1234"
-    if not any("LIC" in t.upper() for t in detected_texts):
-        return False, "Missing license text"
-    return True, None
+    try:
+        results = reader.readtext(image)
+        detected_texts = [res[1] for res in results]
+        print("Detected:", detected_texts)
+        if not any("LIC" in t.upper() for t in detected_texts):
+            return False, "Missing license text"
+        return True, None
+    except Exception as e:
+        return False, f"OCR failed: {str(e)}"
+
 
 
 #--------- Schemas ----------
@@ -128,73 +139,71 @@ class AnalyzeResponse(BaseModel):
 #--------- Route ----------
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(
-image_url: str = Form(...), # public Supabase URL for the stored image
-lat: float = Form(...),
-lon: float = Form(...),
-qr_value: str = Form(""),
-report_id: Optional[str] = Form(None), # Supabase reports.id for server-side update
+    image_url: str = Form(...), # public Supabase URL for the stored image
+    lat: float = Form(...),
+    lon: float = Form(...),
+    qr_value: str = Form(""),
+    report_id: Optional[str] = Form(None), # Supabase reports.id for server-side update
 ):
-# 1) Quick URL reachability check
-try:
-    r = requests.head(image_url, timeout=5)
-    if r.status_code >= 400:
-        return {"status": "error", "message": "Image URL not accessible"}
-except Exception:
-    return {"status": "error", "message": "Image URL check failed"}
-
-# 2) Geofence & time window
-ok_geo, geo_msg = check_geofence(lat, lon)
-ok_time, time_msg = check_time_window(datetime.now(timezone.utc))
-
-try:
-    img = load_image_from_url(image_url)
-
-    ok_size, size_msg = check_billboard_size(img)
-    ok_text, text_msg = check_text_compliance(img)
-
-    if not ok_size:
-        violations.append(size_msg)
-    if not ok_text:
-        violations.append(text_msg)
-
-except Exception as e:
-    violations.append(f"ML check failed: {str(e)}")
-
-
-# 3) QR HMAC verification (optional)
-if qr_value:
-    ok_qr, qr_msg = verify_qr_hmac(qr_value)
-else:
-    ok_qr, qr_msg = True, None   # ✅ treat missing QR as allowed
-
-
-# 4) Content policy (NSFW) - stub for now
-nsfw_threshold = 0.80
-try:
-    nsfw_score = nsfw_prob_stub(image_url)  # replace with real model later
-except Exception:
-    nsfw_score = 0.0  # fail-open
-
-# 5) Collect violations
-violations = []
-if not ok_geo: violations.append(geo_msg)
-if not ok_time: violations.append(time_msg)
-if not ok_qr: violations.append(qr_msg)
-if nsfw_score >= nsfw_threshold: violations.append("NSFW content")
-
-if violations:
-    status = "violation"
-    message = "; ".join([m for m in violations if m])
-else:
-    status = "success"
-    message = "All checks passed"
-
-# 6) Server-side update of Supabase row (if report_id provided and service key set)
-if supabase and report_id:
+    # 1) Quick URL reachability check
     try:
-        supabase.table("reports").update({"status": status, "message": message}).eq("id", report_id).execute()
+        r = requests.head(image_url, timeout=5)
+        if r.status_code >= 400:
+            return {"status": "error", "message": "Image URL not accessible"}
     except Exception:
-        # Don't fail the API response if the update fails; log in real deployment
-        pass
+        return {"status": "error", "message": "Image URL check failed"}
 
-return {"status": status, "message": message}
+    # 2) Geofence & time window
+    ok_geo, geo_msg = check_geofence(lat, lon)
+    ok_time, time_msg = check_time_window(datetime.now(timezone.utc))
+
+    violations = []
+
+    try:
+        img = load_image_from_url(image_url)
+
+        ok_size, size_msg = check_billboard_size(img)
+        ok_text, text_msg = check_text_compliance(img)
+
+        if not ok_size:
+            violations.append(size_msg)
+        if not ok_text:
+            violations.append(text_msg)
+
+    except Exception as e:
+        violations.append(f"ML check failed: {str(e)}")
+
+    # 3) QR HMAC verification (optional)
+    if qr_value:
+        ok_qr, qr_msg = verify_qr_hmac(qr_value)
+    else:
+        ok_qr, qr_msg = True, None   # ✅ treat missing QR as allowed
+
+    # 4) Content policy (NSFW) - stub for now
+    nsfw_threshold = 0.80
+    try:
+        nsfw_score = nsfw_prob_stub(image_url)  # replace with real model later
+    except Exception:
+        nsfw_score = 0.0  # fail-open
+
+    # 5) Collect violations
+    if not ok_geo: violations.append(geo_msg)
+    if not ok_time: violations.append(time_msg)
+    if not ok_qr: violations.append(qr_msg)
+    if nsfw_score >= nsfw_threshold: violations.append("NSFW content")
+
+    if violations:
+        status = "violation"
+        message = "; ".join([m for m in violations if m])
+    else:
+        status = "success"
+        message = "All checks passed"
+
+    # 6) Server-side update of Supabase row (if report_id provided and service key set)
+    if supabase and report_id:
+        try:
+            supabase.table("reports").update({"status": status, "message": message}).eq("id", report_id).execute()
+        except Exception:
+            # Don't fail the API response if the update fails; log in real deployment
+            pass
+    return {"status": status, "message": message}
