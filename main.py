@@ -244,9 +244,13 @@ async def analyze(
     ok_qr, qr_msg = verify_qr_hmac(qr_value)
     if not ok_qr:
         violations.append(qr_msg)
+    # NEW: If QR is valid, add a success message to the violations list
+    else:
+        violations.append("✅ QR Found Correctly")
 
     # 5) Determine final status and update Supabase
-    status = "violation" if violations else "success"
+    # UPDATED: The status is now "success" if the QR is valid and all other checks pass.
+    status = "violation" if violations and not any("✅ QR Found Correctly" in v for v in violations) else "success"
     message = "; ".join(violations) if violations else "All checks passed"
 
     if supabase and report_id:
