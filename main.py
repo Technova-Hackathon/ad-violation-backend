@@ -17,7 +17,7 @@ from pydantic import BaseModel
 from PIL import Image
 from io import BytesIO
 
-# Supabase Admin (service role) to update rows server-side
+# Supabase Admin to update rows server-side
 from supabase import create_client, Client
 
 # The core API client for Gemini
@@ -47,7 +47,7 @@ supabase: Optional[Client] = None
 if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
-# Geofence and time window (customize these)
+# Geofence and time window
 GEOFENCE_CENTER = (12.9716, 77.5946) # (lat, lon)
 GEOFENCE_RADIUS_M = 150 # meters
 WINDOW_START = datetime(2025, 8, 22, 8, 0, 0, tzinfo=timezone.utc)
@@ -99,6 +99,7 @@ def load_image_from_url(url: str):
     """Fetches an image from a URL and returns it as base64 data."""
     r = requests.get(url, timeout=10)
     r.raise_for_status()
+
     # Convert image to bytes and then to base64
     img = Image.open(BytesIO(r.content)).convert("RGB")
     buf = BytesIO()
@@ -244,12 +245,11 @@ async def analyze(
     ok_qr, qr_msg = verify_qr_hmac(qr_value)
     if not ok_qr:
         violations.append(qr_msg)
-    # NEW: If QR is valid, add a success message to the violations list
+    # If QR is valid, add a success message to the violations list
     else:
         violations.append("✅ QR Found Correctly")
 
     # 5) Determine final status and update Supabase
-    # UPDATED: The status is now "success" if the QR is valid and all other checks pass.
     status = "violation" if violations and not any("✅ QR Found Correctly" in v for v in violations) else "success"
     message = "; ".join(violations) if violations else "All checks passed"
 
